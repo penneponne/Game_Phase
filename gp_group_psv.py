@@ -1,41 +1,4 @@
 #!/usr/bin/env python3
-"""gp_group_psv.py — PackedSfenValue (.bin) 教師局面を GamePhase (GP) でグルーピング v2
-
-Pyfamate (https://github.com/SH11235/pyfamate) の GP 計算モジュール。
-PackedSfenValue 40B フォーマットは rshogi gensfen / tatara / bullet-shogi と
-完全互換 — これらで生成した教師 .bin をそのまま入力できる。
-  - rshogi   : https://github.com/SH11235/rshogi   (gensfen / shuffle / rescore)
-  - tatara   : https://github.com/SH11235/tatara    (NNUE GPU 学習)
-  - bullet-shogi: https://github.com/SH11235/bullet-shogi (NNUE 学習, 旧)
-
-  GP でバケット分割した .bin は tatara nnue-train (--data) にそのまま渡せる。
-  ⚠ tatara progress-kpabs-train は対局順の連続 PSV が必須のため、GP 分割後の
-  データは progress 学習には使用不可。progress.bin は分割前のデータで生成すること。
-
-GP 計算は gp_core.py (Pyfamate 本体から原文抽出した独立 GP 計算部)。
-60K 行本体の import なしで動く。等価性検証: `python gp_core.py --verify <bin>` /
-高速路検証: `python gp_core.py --verify-fast <bin>` (139,128局面で mismatch 0 確認済)。
-
-  ply の扱い (--ply-mode, 既定 auto):
-    record : レコードの gamePly をそのまま (live 経路と同一式)
-    zero   : ply 項なし (純状態GP)。⚠ 実測 mean|ΔGP|=0.167・バケット移動61.6% —
-             「ply が無い」を 0 で表すと系統バイアスになる。単独使用は非推奨
-    state  : 盤面状態からの期待 ply (較正テーブル) — dedup 教師の「初出対局の
-             ply」ノイズを平滑化。record 比 mean|ΔGP|=0.035・移動13.9%
-    auto   : gamePly>=1 なら record、0(欠損) なら state — ply 欠損がノイズに
-             ならない既定
-  dedup 済み教師 (unique 系) のグルーピング安定性を最優先するなら
-  --ply-mode state を推奨 (記録 ply 自体が per-game ノイズ ±0.03GP を持つため)。
-
-  速度: v2 高速路 (SFEN 往復排除) ~39k pos/s/コア + --workers 並列。
-    16 コア機なら ~500k pos/s 見込み。さらに上 (数億局面) は gp_core の
-    ステータス md 記載の numba/GPU/Rust 移植パスを参照。
-
-  使い方:
-    python gp_group_psv.py teacher.bin [--ply-mode state] [--workers 16]
-    python gp_group_psv.py teacher.bin --edges 0,0.25,0.5,0.75,1.0,1.51
-    python gp_group_psv.py teacher.bin --sample 20000 --report-only
-"""
 import argparse
 import os
 import struct
@@ -76,11 +39,10 @@ def bucket_of(gp, edges):
     return len(edges) - 2
 
 
-_W = {}   # worker 初期化パラメータ (fork 継承)
+_W = {}
 
 
 def _worker(args):
-    """レコード範囲 [lo, hi) を処理し (counts, score_sum, ply_sum, hist, bucket_bytes, bad) を返す。"""
     lo, hi = args
     path, edges, ply_mode, keep_bytes, stride = (
         _W["path"], _W["edges"], _W["ply_mode"], _W["keep"], _W["stride"])
@@ -115,8 +77,6 @@ def _worker(args):
 
 def _group_one_numba(bin_path, edges, ply_mode, out_dir, stem, report_only,
                      limit=0, writers=None):
-    """numba レーンで 1 ファイルをグルーピング。累積統計 dict を返す。
-    writers が渡された場合はバケットファイルに append。"""
     import numpy as np
     gp, sc, pl = gp_core.gp_batch_file(bin_path, ply_mode)
     if limit:
@@ -172,18 +132,15 @@ def main():
     ap.add_argument("--out-dir", default=None)
     args = ap.parse_args()
 
-    # ── ディレクトリ指定: .done マーカー付き bin を順次処理 ──
     if os.path.isdir(args.bin):
         bin_files = gp_core.expand_bin_paths_done(args.bin, require_done=args.require_done)
         if not bin_files:
             sys.exit(f"[gp] .done 付き .bin が見つかりません: {args.bin}")
-        # フォルダ名を stem に
         stem = os.path.basename(os.path.abspath(args.bin).rstrip("/\\")) or "group"
     else:
         bin_files = [args.bin]
         stem = os.path.splitext(os.path.basename(args.bin))[0]
 
-    # 最初のファイルで sanity check
     ok, msg = psv_sanity(bin_files[0])
     if not ok:
         sys.exit(f"[gp] psv sanity NG: {msg}")
@@ -193,7 +150,6 @@ def main():
     out_dir = args.out_dir or os.path.join(".", f"{stem}_gp")
     os.makedirs(out_dir, exist_ok=True)
 
-    # ── numba バッチレーン ──
     if args.lane != "py" and gp_core.NUMBA_OK and not args.sample:
         import numpy as np
         t0 = time.perf_counter()
@@ -202,7 +158,6 @@ def main():
             for i in range(nb):
                 name = os.path.join(out_dir, f"{stem}_gp_{edges[i]:.2f}-{edges[i+1]:.2f}.bin")
                 writers[i] = gp_core.ChunkedBinWriter(name, max_bytes=args.split_bytes)
-        # 統計の累積
         total_counts = [0] * nb
         total_ssum = [0.0] * nb
         total_psum = [0.0] * nb
@@ -253,7 +208,6 @@ def main():
             print(f"[gp] buckets → {out_dir}/{stem}_gp_*.bin")
         return
 
-    # ── Python (マルチプロセス) レーン — 単一ファイルのみ ──
     if len(bin_files) > 1:
         sys.exit("[gp] Python レーンはディレクトリ非対応。numba を導入するか "
                  "個別ファイルを指定してください")
