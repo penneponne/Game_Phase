@@ -1,71 +1,30 @@
 #!/usr/bin/env python3
-"""gp_core.py — Pyfamate GamePhase (GP) 計算部の独立抽出版
-
-Pyfamate (https://github.com/SH11235/pyfamate) の GP (GamePhase) 計算コア。
-PackedSfenValue 40B フォーマットは rshogi / tatara / bullet-shogi と完全互換。
-  - rshogi   : https://github.com/SH11235/rshogi
-  - tatara   : https://github.com/SH11235/tatara
-  - bullet-shogi: https://github.com/SH11235/bullet-shogi
-
-Pyfamate.py 本体から GP 計算チェーンを**原文そのまま抽出**した、単体で動く
-モジュール。60K 行本体の import (資源プローブ・diagnosis.txt 書込) なしで
-教師局面 (PackedSfenValue 40B) の GP を計算できる。
-
-  チェーン (すべて Pyfamate.py と同一コード):
-    packed-sfen 32B --(_fast_decode_psfen_into: Huffman LUT)--> SvBoard
-      --(_svboard_to_sfen)--> SFEN --(MiniBoard: 薄い sfen パーサ)--> 盤面
-      --(_game_phase_state_counts_core: 原文)--> 5特徴
-      --(_calc_state_phase: 原文, cfg=正準 GP パラメータ)--> GP ∈ [0, 1.5]
-
-  正準パラメータ: _GAME_PHASE_DEFAULT_VEC (WP1 同期済み _CONFIG_DEFAULTS と
-  同値であることを実測確認済み 2026-07-14)。ply 項は record の gamePly を使用
-  (GP_Ply_Enable=True が正準)。child_agreement 軸は教師局面に存在しないため
-  非適用 = _calc_game_phase(pos, cfg, child_agreement=None) と同値。
-
-  等価性: dlsuisho_unique_019.bin 実データで Pyfamate 本体 import 経路と
-  全一致検証済み (--verify で再実行可能)。
-
-  API:
-    gp_of_sfen(sfen_str, ply=0) -> float
-    gp_of_record(raw40: bytes)  -> (gp, score, gameply)
-    iter_psv(path)              -> yield (raw40, data32, score, move16, gameply, result)
-
-  CLI:
-    python gp_core.py --sfen "lnsg..." [--ply N]
-    python gp_core.py --verify teacher.bin --engine Pyfamate.py [--n 3000]
-"""
 import math
 import os
 import struct
 import sys
 
 PSV_RECORD_SIZE = 40
-PSV_FMT = "<32shHHbB"   # data[32], s16 score, u16 move, u16 gamePly, s8 result, u8 pad
+PSV_FMT = "<32shHHbB"
 
 
 def _clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
 
 
-# ══ 以下、Pyfamate.py からの原文抽出 (改変なし) ═══════════════════════════
 _HUF_BOARD = [
-    (0x00, 1),  # NO_PIECE_TYPE
-    (0x01, 2),  # PAWN
-    (0x03, 4),  # LANCE
-    (0x0b, 4),  # KNIGHT
-    (0x07, 4),  # SILVER
-    (0x1f, 6),  # BISHOP
-    (0x3f, 6),  # ROOK
-    (0x0f, 5),  # GOLD
+    (0x00, 1),
+    (0x01, 2),
+    (0x03, 4),
+    (0x0b, 4),
+    (0x07, 4),
+    (0x1f, 6),
+    (0x3f, 6),
+    (0x0f, 5),
 ]
 
-# 手駒/駒箱用 (board コードの bit0 を落としたもので照合)
-# hand コード = board_code >> 1, hand_bits = board_bits - 1
 _HUF_HAND_MATCH = [(code >> 1, bits - 1) for code, bits in _HUF_BOARD]
 
-# ── [FAST-PSFEN 2026-07] PackedSfen → SvBoard 直接デコード LUT ──────────
-# 旧 _decode_packed_sfen (削除済み、ビット単位 Huffman while/for ×500 回) + set_sfen
-# (SFEN 文字列パース) の二重デコードを LUT 1 回引き + int shift に置換。
 
 _PSFEN_SQ_MAP = tuple((sq % 9) * 9 + 8 - (sq // 9) for sq in range(81))
 
@@ -106,7 +65,6 @@ _FAST_HAND_LUT = tuple(_FAST_HAND_LUT)
 
 
 def _fast_decode_psfen_into(data32, sb):
-    """32-byte PackedSfen → SvBoard 直接デコード。"""
     bint = int.from_bytes(data32, 'little')
     cells = sb.cells
     hand0 = sb.hand[0]
@@ -152,7 +110,6 @@ _PID_SFEN = (None,
 
 
 def _svboard_to_sfen(sb):
-    """SvBoard → SFEN 文字列 ("<board> <turn> <hand> <ply>")。"""
     cells = sb.cells
     ranks = []
     for r in range(9):
@@ -185,30 +142,25 @@ def _svboard_to_sfen(sb):
 
 
 def _fast_psfen_to_sfen(data32):
-    """packed-sfen 32bytes → SFEN 文字列。LUT 高速デコーダ経由。"""
     sb = SvBoard()
     _fast_decode_psfen_into(data32, sb)
     return _svboard_to_sfen(sb)
 
 
-# [GP-v3 2026-07-14] 駒種価値テーブル (学習対象)。Pyfamate 本体と同値。
-#   GP_HAND_VALS[7]  : 手駒価値 P L N S G B R。P=1 がスケールアンカー。
-#   GP_CAMP_VALS[13] : 敵陣内の駒価値。生駒 P L N S G B R (idx0..6) +
-#                      成駒 +P +L +N +S +B +R (idx7..12)。
 GP_HAND_VALS = [1.0,    2.9878, 2.9303, 4.8517, 4.915,  7.7843, 9.8869]
 GP_CAMP_VALS = [1.0601, 1.0085, 1.016,  1.0546, 1.0494, 1.0528, 1.0605,
                 0.9574, 1.0072, 1.0054, 1.0159, 1.031,  1.0719]
 CAMP_TYPE_NAMES = ("P", "L", "N", "S", "G", "B", "R",
                    "+P", "+L", "+N", "+S", "+B", "+R")
-_GAME_PHASE_KING_SENTE_ROW = 7   # USI row7 = 将棋7段目（先手: 9段目スタートから2段上がった位置）
-_GAME_PHASE_KING_GOTE_ROW  = 3   # USI row3 = 将棋3段目（後手: 1段目スタートから2段下がった位置）
+_GAME_PHASE_KING_SENTE_ROW = 7
+_GAME_PHASE_KING_GOTE_ROW  = 3
 
 _GAME_PHASE_DEFAULT_VEC = (
-    0.266368, 0.0, 0.275166, 0.352129,           # W_Hand, W_Promo, W_Camp, W_King
-    1.839152, 5.437156, 1.000000, 0.100000,      # Hand_Ref, Promo_Ref, Camp_Ref, King_Ref
-    1.285300,                                    # Scale (fix_scale=1 で固定)
-    0.531332, 4.362364,                          # Nyugyoku_King_Onset, Nyugyoku_King_Full [FIT 2026-07-15]
-    0.074838, 163.738998, 0.0, 12.181117,        # W_Ply, Ply_Ref, W_Exposure, Exposure_Ref
+    0.266368, 0.0, 0.275166, 0.352129,
+    1.839152, 5.437156, 1.000000, 0.100000,
+    1.285300,
+    0.531332, 4.362364,
+    0.074838, 163.738998, 0.0, 12.181117,
 )
 
 
@@ -218,7 +170,7 @@ class _GpParamView:
         "game_phase_hand_ref", "game_phase_promo_ref", "game_phase_camp_ref", "game_phase_king_ref",
         "game_phase_scale", "game_phase_nyugyoku_king_onset", "game_phase_nyugyoku_king_full",
         "game_phase_w_ply", "game_phase_ply_ref", "game_phase_w_exposure", "game_phase_exposure_ref",
-        "game_phase_ply_enable",   # [GP-PLY-TOGGLE] vec 外のフラグ。make_view が global から設定。
+        "game_phase_ply_enable",
     )
 
     def __init__(self, vec):
@@ -228,30 +180,11 @@ class _GpParamView:
          self.game_phase_nyugyoku_king_full,
          self.game_phase_w_ply, self.game_phase_ply_ref,
          self.game_phase_w_exposure, self.game_phase_exposure_ref) = vec
-        # [GP-PLY-TOGGLE] vec は 15 重みのみ。PLY 有効フラグは学習対象でないので別管理。
-        # 既定 True (= 従来挙動)。_game_phase_fit_make_view が live と同じ global へ揃える。
         self.game_phase_ply_enable = True
 
 
 def _calc_state_phase(WHAND: int, PROMO: int, CAMP: int, KING: float,
                       EXPOSURE: int, *, cfg, ply: int = 0) -> float:
-    """
-    [GP] 盤面状態の6構成要素から state 軸進行度 GP ∈ [0.0, 1.5] を計算する。
-
-    確定式（6特徴飽和 + 入玉域加点）:
-      S = W_Hand·WHAND/Ref_Hand + W_Promo·PROMO/Ref_Promo + W_Camp·CAMP/Ref_Camp
-        + W_King·KING/Ref_King + W_Ply·PLY/Ref_Ply + W_Expo·EXPOSURE/Ref_Expo
-      game_phase_core = 1 − exp(−S / Scale)                       … 進行度コア [0, 1)
-      bonus   = 0.5 · clamp((KING−Onset)/(Full−Onset), 0, 1)  … 入玉域加点 [0, 0.5]
-      GP      = clamp( game_phase_core + bonus, 0.0, 1.5 )
-
-    WHAND    : 駒価値加重手駒合計 (_GP_HAND_VALUES: P=1, L=3, N=3, S=5, G=5, B=8, R=10)
-    PROMO    : 盤上の成駒数 (両者)
-    CAMP     : 敵陣3段以内の玉以外の駒数
-    KING     : 玉前進シグナル (ShogiBoard.king_advance_signal, 0〜12)
-    EXPOSURE : 玉露出度 = 16 − ring1 味方駒合計 (0=完全防御, 16=完全露出)
-    ply      : 手数。既定 0 (序盤安全側: S への寄与ゼロ)。
-    """
     _w_hand    = cfg.game_phase_w_hand
     _w_promo   = cfg.game_phase_w_promo
     _w_camp    = cfg.game_phase_w_camp
@@ -265,35 +198,6 @@ def _calc_state_phase(WHAND: int, PROMO: int, CAMP: int, KING: float,
     _ply_ref   = cfg.game_phase_ply_ref
     _w_expo    = cfg.game_phase_w_exposure
     _expo_ref  = cfg.game_phase_exposure_ref
-    # ───────────────────────────────────────────────────────────────────────
-    # [GP-PLY-TOGGLE] PLY(手数) を進行度 S に入れるか (cfg.game_phase_ply_enable)。
-    #
-    #   True  (既定): 従来どおり手数項 _w_ply·ply/_ply_ref を S に加える。
-    #   False       : 手数項を落とし、GP を盤面状態のみの関数 (pure-state) にする。
-    #
-    # なぜトグルにしたか — これは「決着のついていない設計上の争点」で、強さは
-    # 作者が A/B (SPRT) でしか判定できないため、敢えて切替可能にした:
-    #
-    #   (a) pure-state 派の論拠: GP は本来「現局面の状態のみから測る」設計
-    #       (この関数の冒頭 docstring / [GP-状態化] 参照)。狙いは履歴を持たない
-    #       教師局面 (PackedSfenValue) と live 経路が完全に同一の GP を共有すること。
-    #       PLY=手数は履歴由来の量なので、これを入れると同じ盤面でも
-    #       "position startpos moves …"(ply=N) と "position sfen <盤面>"(ply=0) で
-    #       GP が変わり、その不変条件を破る。
-    #       さらに game_phase_fit の順序ペア学習 (late_ply>early_ply) では PLY が
-    #       順位変数そのもの=トートロジーで、fit が「GP≒手数」へ寄った PLY 支配の
-    #       不安定な盆地へ落ちやすい (GP_W_Ply の run-to-run 不安定の主因)。
-    #
-    #   (b) ply 活用派の論拠: 正しい重みづけを与えれば手数も進行度推定の有効な
-    #       手掛かりになりうる (nodchip / やねうらお 系の教師生成・評価の知見)。
-    #       live では手数は常に得られるので、pure-state 不変条件を実用上の制約と
-    #       見なさず「手数も一つの武器」として使う立場もありうる。
-    #
-    # False は「同じ学習済み重みのまま手数項だけ落とす」即時 A/B で、再 fit は不要。
-    # 完全に ply-free な較正が欲しければ GP_Ply_Enable=false のまま game_phase_fit を
-    # 再走させること (tool/fit 経路も本フラグ = module global _game_phase_ply_enable を
-    # 参照し、live と同一の GP を学習・評価する)。
-    # ───────────────────────────────────────────────────────────────────────
     _ply_term = (_w_ply * ply / _ply_ref) if cfg.game_phase_ply_enable else 0.0
     S = (_w_hand  * WHAND / _hand_ref +
          _w_promo * PROMO / _promo_ref +
@@ -301,26 +205,14 @@ def _calc_state_phase(WHAND: int, PROMO: int, CAMP: int, KING: float,
          _w_king  * KING  / _king_ref +
          _ply_term +
          _w_expo  * EXPOSURE / _expo_ref)
-    # 飽和コア: 序中盤〜終盤の進行度 [0, 1)。数学的に 1.0 未満（exp>0）。
-    # 【最適化 1-4】S が大きい終盤では exp(-S/scale) ≈ 0 なので早期リターン。
-    # exp(-10) ≈ 4.5e-5 → game_phase_core ≈ 1.0 (誤差 0.005%) で打ち切り。
     neg_s_over_scale = -S / _scale
     if neg_s_over_scale < -10.0:
         game_phase_core = 1.0
     else:
         game_phase_core = 1.0 - math.exp(neg_s_over_scale)
 
-    # [GP-入玉域] 入玉域 (1.0, 1.5] への接続。飽和コアは 1.0 を超えられないため、
-    # これを足さない限り上限 1.5 も stats の nyugyoku=(game_phase>1.0) も永久に発火しない
-    # （準備実装が未接続だった）。起爆要因は KING(玉前進深さ)のみ＝真に王が敵陣
-    # 深くへ入った時だけ加点する。手駒/成駒/侵入の状態量だけでは入玉域に入れない
-    # （それらは game_phase_core 側で既に 1.0 近傍に飽和させる役割を持つ）。
-    #   deep=0           → 加点 0      → GP は game_phase_core のまま (<1.0)、従来挙動
-    #   deep≥(Full-Onset)→ 加点 +0.5   → GP=min(1.5, game_phase_core+0.5) で入玉域フル
-    # 線形補間。下流 phase 系は _game_phase_for_phase_council() で入玉域を折り返し、
-    # council 重み / WR slope を序盤側へ回復させる (NYUG-DLR)。
     _onset = cfg.game_phase_nyugyoku_king_onset
-    _full  = cfg.game_phase_nyugyoku_king_full   # from_cfg/loader が _full > _onset を保証
+    _full  = cfg.game_phase_nyugyoku_king_full
     nyugyoku_bonus = 0.0
     if KING > _onset:
         frac = (KING - _onset) / (_full - _onset)
@@ -329,49 +221,13 @@ def _calc_state_phase(WHAND: int, PROMO: int, CAMP: int, KING: float,
         nyugyoku_bonus = 0.5 * frac
 
     game_phase = game_phase_core + nyugyoku_bonus
-    return _clamp(game_phase, 0.0, 1.5)   # > 1.0 は入玉域
+    return _clamp(game_phase, 0.0, 1.5)
 
 
-# [NYUG-DLR v6.1] GP 入玉域の幅 (1.0 → 1.5)。GP 設計の構造定数 (game_phase_fit アンカー:
-# 玉前進 onset 局面=1.0 / 宣言成立局面=1.5) であり、調整パラメータではない。
 _GAME_PHASE_NYUGYOKU_BAND_WIDTH = 0.5
 
 
 def _game_phase_for_phase_council(raw_game_phase: float, restore_ratio: float) -> float:
-    """[NYUG-DLR] council phase 系向けの GP 正規化 — 入玉域で DL 信頼を回復する。
-
-    純粋関数。raw_game_phase ∈ [0, 1.5] を phase 座標 [0, 1] へ写像する:
-      raw_game_phase ≤ 1.0          → raw_game_phase そのまま (_game_phase_for_phase と同値 = 旧挙動)
-      raw_game_phase ∈ (1.0, 1.5]   → 1 − restore_ratio × (raw_game_phase−1.0)/0.5 へ折り返し
-
-    根拠 (WCSC33〜35 / 電竜戦 知見):
-      ・dlshogi WCSC35: 入玉特徴量 (入玉有無・敵陣内駒数の残り・宣言までの残り
-        点数) の追加で「入玉するかの見極めが上手くなった」— DL 系は入玉局面の
-        判断に適性がある。
-      ・やねうら王ブログ: NNUE 系は Label Smoothing 由来で評価値絶対値の上限が
-        縮み、入玉将棋で指し手間の評価値差が潰れる構造的弱点を持つ (水匠 7 以降も
-        fine tuning 元から継承)。
-      ・既存実装との整合: 入玉域で Consensus Skip を切り DL_2 の
-        第3意見を必ず聞く「慎重側」だが、phase weight / game_phase_trust は
-        _game_phase_for_phase の 1.0 飽和により入玉域でも weight_late / game_phase_trust_min
-        (NNUE 最優位) に張り付いたままで、聞いた DL の意見が票決で最弱という
-        ねじれがあった。本関数はそのねじれを解消する。
-
-    定数の出自 (新規マジック定数なし):
-      ・折り返しの端点は呼び出し側の weight_early/weight_late ・
-        game_phase_trust_max/game_phase_trust_min — いずれも SPSA 校正済みの既存値。
-        本関数は両端点の「間」を動くだけで、校正レンジ外の重みは作らない。
-      ・帯幅 0.5 (_GAME_PHASE_NYUGYOKU_BAND_WIDTH) は GP 入玉域 [1.0, 1.5] の構造定数。
-        game_phase_fit は宣言成立局面を GP=1.5 アンカーで校正するため、
-        restore_ratio=1.0 なら「宣言級の入玉局面で DL を序盤並みに信頼」となる。
-      ・restore_ratio は Council_Nyugyoku_DL_Restore (config / SPSA 調整可)。
-        0.0 で完全に旧挙動 (本関数 ≡ _game_phase_for_phase)。
-
-    入玉域加点 (raw_game_phase>1.0) は KING (玉前進深さ) のみを起爆要因とする設計
-    (_calc_state_phase 参照) のため、本折り返しも「真に玉が敵陣深くへ入った局面」
-    でのみ発動する。下流の _calc_phase_weight_game_phase / _calc_dl_phase_trust の
-    入力契約 [0,1] は維持される。
-    """
     if raw_game_phase is None:
         return 0.0
     if raw_game_phase <= 1.0 or restore_ratio <= 0.0:
@@ -383,15 +239,6 @@ def _game_phase_for_phase_council(raw_game_phase: float, restore_ratio: float) -
 
 
 def _game_phase_state_counts_core(board: "ShogiBoard") -> tuple:
-    """盤面状態 → GP の 5 構成要素 (whand, promoted, wcamp, king, exposure)。純粋関数。
-
-    [GP-v3 2026-07-14] 駒種を学習対象化:
-      whand : Σ hand_count[t]·GP_HAND_VALS[t] (先手+後手, 7駒種)
-      promoted : 盤上の成駒数 (両者)
-      wcamp : Σ camp_count[t]·GP_CAMP_VALS[t] (敵陣内 生駒7種+成駒6種, 玉除く)
-      king  : ShogiBoard.king_advance_signal() (0〜12)
-      exposure : 16 − 両玉 ring1 味方駒合計
-    """
     _HAND_IDX = {"P": 0, "L": 1, "N": 2, "S": 3, "G": 4, "B": 5, "R": 6}
     whand = 0.0
     for hand in (board.sente_hand, board.gote_hand):
@@ -434,7 +281,6 @@ def _game_phase_state_counts_core(board: "ShogiBoard") -> tuple:
 
 
 class SvBoard:
-    """デコード先の最小コンテナ (Pyfamate SvBoard の decode 互換サブセット)。"""
     def __init__(self):
         self.cells = [0] * 81
         self.hand = [[0] * 7, [0] * 7]
@@ -443,11 +289,6 @@ class SvBoard:
 
 
 class MiniBoard:
-    """SFEN → _game_phase_state_counts_core が要求する最小盤面表現。
-
-    ShogiBoard 互換の属性のみ提供: .board {(file,rank):pc} / .sente_hand /
-    .gote_hand / .king_advance_signal()。_king_pos / king_advance_signal は
-    ShogiBoard の原文移植 (下記 2 メソッド)。"""
     def __init__(self, sfen_body: str):
         board_part, turn, hand_part = (sfen_body.split() + ["-"])[:3]
         self.board = {}
@@ -486,7 +327,6 @@ class MiniBoard:
                 tgt[ch] = tgt.get(ch, 0) + n
 
     def _king_pos(self, side: str):
-        # [perf] O(1) キャッシュ参照 (フォールバック: None 時は全走査で再充填)
         _idx = 0 if side == "b" else 1
         _kp = self._kpos[_idx]
         if _kp is not None:
@@ -499,7 +339,6 @@ class MiniBoard:
         return None
 
     def king_advance_signal(self) -> float:
-        """[KING-v2 2026-07-14] 随伴ゲート付き玉前進シグナル (features_from_cells と同一仕様)。"""
         total = 0.0
         for side, entry, ahead in (("b", _GAME_PHASE_KING_SENTE_ROW, -1),
                                    ("w", _GAME_PHASE_KING_GOTE_ROW, 1)):
@@ -528,18 +367,8 @@ class MiniBoard:
 
 
 
-# ══ 高速路 + ply モード (v2 2026-07-14) ═══════════════════════════════════
 
 def features_from_cells(sb):
-    """SvBoard.cells/hand → GP v3 特徴 (駒種別カウント)。
-
-    Returns: (h7, c13, promo, king, expo)
-      h7   : 手駒カウント (両者合算) P L N S G B R
-      c13  : 敵陣内の駒カウント (両者合算・玉除く) — CAMP_TYPE_NAMES 順
-      promo: 盤上成駒数 (両者) / king: KING-v2 / expo: 玉露出度
-    加重和 (whand/wcamp) は gp_of_features が GP_HAND_VALS/GP_CAMP_VALS で取る。
-    [GP-v3 2026-07-14] 旧 5-tuple (whand, promo, camp, king, expo) から変更。
-    """
     cells = sb.cells
     h0, h1 = sb.hand
     h7 = tuple(h0[k] + h1[k] for k in range(7))
@@ -558,7 +387,7 @@ def features_from_cells(sb):
             ks = (r, c); continue
         if pid == 22:
             kw = (r, c); continue
-        base = (pid - 1) % 14 + 1          # 1..7 生駒 / 9..14 成駒 (8=玉は除外済)
+        base = (pid - 1) % 14 + 1
         t = (base - 1) if base <= 7 else (7 + base - 9)
         is_sente = pid <= 14
         if base >= 9:
@@ -583,7 +412,6 @@ def features_from_cells(sb):
             if max(abs(r - kr), abs(c - kc)) == 1:
                 ally_ring1 += 1
     exposure = 16 - ally_ring1
-    # [KING-v2] 随伴ゲート + 半段クレジット (v2 と同一)
     king = 0.0
     if ks is not None:
         raw = _GAME_PHASE_KING_SENTE_ROW - (ks[0] + 1)
@@ -611,18 +439,10 @@ def features_from_cells(sb):
 
 
 
-# [PLY-CALIB] 純状態GP(ply=0) 0.05ビン → gamePly 中央値。dlsuisho_unique_019
-# (139,128局面) から較正 (--calibrate で任意データから再生成可)。
-# 用途: ply 不明/不定 (dedup教師の初出ply等) のとき、記録plyの代わりに
-# 「この盤面状態なら典型的に何手目か」を与え、ply項の欠落が GP を系統的に
-# 押し下げるバイアス (live は常に ply>0) を除去する。
 _PLY_CALIB = (42.0, 59.0, 65.0, 67.0, 83.0, 93.0, 100.0, 107.0, 117.0, 120.0, 120.0, 119.0, 120.0, 125.0, 127.0, 132.0, 131.0, 134.0, 140.0, 149.0, 164.0, 186.0, 229.0, 240.0, 264.0, 282.0)
-# ↑ dlsuisho_unique_019.bin (139,128局面) 較正 [KING-v2 2026-07-14 再生成]。
-#   v2で単調化 (旧テーブルの谷は入玉ボーナス崖のアーチファクトだった)。
 
 
 def estimate_ply_from_state(gp0: float) -> float:
-    """純状態GP → 期待 gamePly (較正テーブル線形補間)。"""
     t = _PLY_CALIB
     if not t:
         return 0.0
@@ -634,14 +454,7 @@ def estimate_ply_from_state(gp0: float) -> float:
     return t[k] * (1.0 - f) + t[k + 1] * f
 
 
-# ══ numba JIT レーン (任意・自動フォールバック) ═══════════════════════════
-# 17k/s → 数十万/s 問題への回答。GPU (tarara/rshogi 級) の前段として、
-# 同一アルゴリズムを numba で JIT する。decode は可変長 Huffman で bit 直列
-# だがレコード間は完全独立 = prange 並列が線形に効く。等価性は
-# --verify-numba で全量機械検証 (float64 同順演算なので通常 max|Δ|=0)。
 try:
-    # [EXE 2026-07-14] PyInstaller frozen 時は numba の JIT キャッシュ先を
-    # 書込可能な一時領域へ (exe 内部パスへの cache 書込失敗を防ぐ)。
     if getattr(sys, "frozen", False):
         os.environ.setdefault(
             "NUMBA_CACHE_DIR",
@@ -668,7 +481,6 @@ if NUMBA_OK:
     def _nb_gp_all(buf, n, board_lut, hand_lut, sqmap, hv, cv, calib,
                    wh, wpm, wc, wk, hr, pr, cr, kr, scale, onset, full,
                    wply, plyref, wexpo, exporef, mode):
-        # mode: 0=record 1=zero 2=state 3=auto
         out = _np.empty(n, _np.float64)
         scores = _np.empty(n, _np.int32)
         plys = _np.empty(n, _np.int32)
@@ -676,9 +488,8 @@ if NUMBA_OK:
             base = rec * 40
             ok = True
             cells = _np.zeros(81, _np.int8)
-            h = _np.zeros(14, _np.int16)   # [owner*7 + idx]
+            h = _np.zeros(14, _np.int16)
             side = buf[base] & 1
-            # bit reads
             b0 = _np.uint32(buf[base]) | (_np.uint32(buf[base + 1]) << 8)
             k0 = (b0 >> 1) & 0x7F
             k1 = (b0 >> 8) & 0x7F
@@ -722,14 +533,12 @@ if NUMBA_OK:
                 scores[rec] = 0
                 plys[rec] = 0
                 continue
-            # score/ply
             s = _np.int32(buf[base + 32]) | (_np.int32(buf[base + 33]) << 8)
             if s >= 32768:
                 s -= 65536
             gameply = _np.int32(buf[base + 36]) | (_np.int32(buf[base + 37]) << 8)
             scores[rec] = s
             plys[rec] = gameply
-            # features v3 (features_from_cells と同一手順・駒種加重)
             whand = 0.0
             for k in range(7):
                 whand += (h[k] + h[7 + k]) * hv[k]
@@ -771,7 +580,6 @@ if NUMBA_OK:
                     if kwr >= 0 and max(abs(r - kwr), abs(c - kwc)) == 1:
                         ring1 += 1
             exposure = 16 - ring1
-            # [KING-v2] 随伴ゲート + 半段クレジット (features_from_cells と同一)
             king = 0.0
             if ksr >= 0:
                 raw_k = 7 - (ksr + 1)
@@ -805,7 +613,6 @@ if NUMBA_OK:
                     if sup > 3:
                         sup = 3
                     king += (raw_k + 0.5) * (0.25 + 0.25 * sup)
-            # GP 式 (_calc_state_phase と同一; float64 同順)
             S0 = (wh * whand / hr + wpm * promoted / pr + wc * wcamp / cr +
                   wk * king / kr + wexpo * exposure / exporef)
             bonus = 0.0
@@ -815,13 +622,11 @@ if NUMBA_OK:
                     frac = 1.0
                 bonus = 0.5 * frac
             def_core = 0.0
-            # ply 決定
             if mode == 0:
                 ply = float(gameply)
             elif mode == 1:
                 ply = 0.0
             else:
-                # gp0 (ply=0)
                 z0 = -S0 / scale
                 c0 = 1.0 if z0 < -10.0 else 1.0 - _np.exp(z0)
                 gp0 = c0 + bonus
@@ -852,8 +657,6 @@ if NUMBA_OK:
 
     @_njit(cache=True, parallel=True)
     def _nb_feat_all(buf, n, board_lut, hand_lut, sqmap):
-        """デコード + v3 特徴抽出のみ (GP計算なし)。GPU fit/grouping の供給源。
-        feat[n,23] = [h7(0:7), c13(7:20), promo(20), king(21), expo(22)]"""
         feat = _np.zeros((n, 23), _np.float32)
         plys = _np.empty(n, _np.int32)
         scores = _np.empty(n, _np.int32)
@@ -901,7 +704,7 @@ if NUMBA_OK:
                         h[hcol * 7 + hidx] += 1
                     cur += hb
             if not ok:
-                feat[rec, 21] = _np.nan   # king=NaN を不良マーカーに
+                feat[rec, 21] = _np.nan
                 plys[rec] = 0
                 scores[rec] = 0
                 continue
@@ -987,17 +790,6 @@ if NUMBA_OK:
         return feat, plys, scores
 
     def features_batch_file(path, cache=True, sample=None, chunk_records=2_000_000):
-        """PSV → 特徴行列 (n,23) f32 + ply + score。<path>.gpfeat.npz にキャッシュ。
-        GPU fit / grouping はデコードを再実行せずこのキャッシュを共有する。
-
-        [BIGBIN 2026-07-15] 旧実装は np.fromfile で全量読み + (n,23) 一括確保 —
-        数 GB 級の教師 bin (n が億単位) で MemoryError。以下に変更:
-          - memmap + chunk_records 単位のチャンク処理 (buf を全量保持しない)
-          - sample=q 指定時は「デコード前に」record 単位の等間隔間引き
-            (memmap を (n,40) に reshape → fancy-index で q 行だけコピー) —
-            全量 materialize が一度も起きない。sample 読みはキャッシュ不整合を
-            避けるため npz を読みも書きもしない
-          - 全量読みでも n > 20M は npz 書き込みを省略 (圧縮/ディスク高コスト)"""
         cp = path + ".gpfeat.npz"
         if (sample is None and cache and os.path.exists(cp)
                 and os.path.getmtime(cp) >= os.path.getmtime(path)):
@@ -1032,8 +824,6 @@ if NUMBA_OK:
         return feat, plys, scores
 
     def gp_batch_file(path, ply_mode="auto"):
-        """ファイル全体を numba バッチ処理。(gp[n] f64, score[n] i32, ply[n] i32)。
-        不良レコードは gp=NaN。"""
         buf = _np.fromfile(path, dtype=_np.uint8)
         n = buf.shape[0] // PSV_RECORD_SIZE
         v = GP_VIEW
@@ -1053,18 +843,11 @@ if NUMBA_OK:
 
 PLY_MODES = ("record", "zero", "state", "auto")
 
-# [NOISE 2026-07-14] 教師局面ノイズ判定 (教師に 100% は無い前提の防御)。
-# 判定はレコード単位・特徴量ベースで安価:
-#   decode不良(kingがNaN) / 手駒が物理上限超 (P18 L4 N4 S4 G4 B2 R2) /
-#   promo>26 / expo∉[0,16] / king>13 / ply∉[1,512] / scoreセンチネル(±32767)
-# 詰みスコア |score|≥30000 はレコード自体は正当なので残すが、WR ペア (eval
-# 順序制約) からは除外する — 30000 は探索の実測evalでなくラベル定数のため。
 _HAND_CAPS = (18, 4, 4, 4, 4, 2, 2)
 _MATE_CP_NOISE = 30000
 
 
 def noise_mask_np(feat, ply, score):
-    """(n,23)特徴 + ply + score → 正常レコード mask と理由別カウント dict。"""
     import numpy as _np2
     n = feat.shape[0]
     ok = ~_np2.isnan(feat[:, 21])
@@ -1088,7 +871,6 @@ def noise_mask_np(feat, ply, score):
 
 
 def expand_bin_paths(path):
-    """--bin にディレクトリを許容: dir なら中の *.bin を昇順で全部。"""
     if os.path.isdir(path):
         import glob as _g
         return sorted(_g.glob(os.path.join(path, "*.bin")))
@@ -1096,9 +878,6 @@ def expand_bin_paths(path):
 
 
 def expand_bin_paths_done(path, require_done=False):
-    """ディレクトリなら中の *.bin を昇順で返す。
-    require_done=True のとき .done マーカー付きの bin だけに絞る。
-    ファイル単体なら従来通りそのまま返す。"""
     if os.path.isdir(path):
         import glob as _g
         all_bins = sorted(_g.glob(os.path.join(path, "*.bin")))
@@ -1112,20 +891,12 @@ def expand_bin_paths_done(path, require_done=False):
     return [path]
 
 
-# [CHUNK-SPLIT] バケット bin 自動分割ライタ。
-# 元教師チャンク (~19GB / ~4.89億局面) と同サイズで分割する。
-_DEFAULT_SPLIT_BYTES = 19_558_599_240   # dlsuisho_unique チャンクサイズ
+_DEFAULT_SPLIT_BYTES = 19_558_599_240
 
 
 class ChunkedBinWriter:
-    """バケット bin を max_bytes 単位で自動分割するライタ。
-    書込み中のファイルが max_bytes を超えたら次のチャンクへ。
-    ファイル名: {stem}_001.bin, {stem}_002.bin, ...
-    max_bytes=0 で分割無効 (単一ファイル)。"""
 
     def __init__(self, path_template, max_bytes=_DEFAULT_SPLIT_BYTES):
-        """path_template: 拡張子付きフルパス (例: out/group_gp_0.00-0.10.bin)。
-        分割時は .bin の前に _001 等を挿入。"""
         self._base = path_template[:-4] if path_template.endswith(".bin") else path_template
         self._max = max_bytes
         self._chunk = 0
@@ -1133,7 +904,6 @@ class ChunkedBinWriter:
         self._f = None
         self._files = []
         if max_bytes <= 0:
-            # 分割無効: そのまま 1 ファイル
             self._f = open(path_template, "wb")
             self._files.append(path_template)
             self._max = 0
@@ -1151,7 +921,6 @@ class ChunkedBinWriter:
         if not data:
             return
         if self._max <= 0:
-            # 分割無効
             self._f.write(data)
             return
         if self._f is None or self._written >= self._max:
@@ -1170,7 +939,6 @@ class ChunkedBinWriter:
 
 
 def gp_of_features(feats, ply: float, hand_vals=None, camp_vals=None) -> float:
-    """v3 特徴 → GP。whand/wcamp を駒種テーブルで加重し既存式へ (式本体は不変)。"""
     h7, c13, promo, king, expo = feats
     hv = hand_vals if hand_vals is not None else GP_HAND_VALS
     cv = camp_vals if camp_vals is not None else GP_CAMP_VALS
@@ -1181,16 +949,6 @@ def gp_of_features(feats, ply: float, hand_vals=None, camp_vals=None) -> float:
 
 
 def gp_of_record_v2(raw40: bytes, ply_mode: str = "auto"):
-    """PSV 40B → (gp, score, gameply)。高速路 + ply モード。
-
-    ply_mode:
-      record : レコードの gamePly をそのまま使う (live 経路と同一の式・従来既定)
-      zero   : ply 項を落とす (純状態 GP — [GP-PLY-TOGGLE] pure-state 派)
-      state  : 記録 ply を無視し、状態からの期待 ply (較正テーブル) を使う —
-               dedup 教師の「初出対局の ply」というノイズ源を平滑化
-      auto   : gamePly>=1 なら record、0 (欠損) なら state — 「ply が存在
-               しないことがノイズにならない」ための既定
-    """
     data32, score, _mv, gameply, _res, _pad = struct.unpack(PSV_FMT, raw40)
     sb = SvBoard()
     _fast_decode_psfen_into(data32, sb)
@@ -1201,18 +959,16 @@ def gp_of_record_v2(raw40: bytes, ply_mode: str = "auto"):
         ply = 0.0
     elif ply_mode == "state":
         ply = estimate_ply_from_state(gp_of_features(feats, 0.0))
-    else:  # auto
+    else:
         ply = (float(gameply) if gameply >= 1
                else estimate_ply_from_state(gp_of_features(feats, 0.0)))
     return gp_of_features(feats, ply), score, gameply
 
 
-# ══ 公開 API ═══════════════════════════════════════════════════════════════
 
-GP_VIEW = _GpParamView(_GAME_PHASE_DEFAULT_VEC)   # 正準パラメータ (ply_enable=True)
+GP_VIEW = _GpParamView(_GAME_PHASE_DEFAULT_VEC)
 
 def gp_of_sfen(sfen_body: str, ply: int = 0) -> float:
-    """SFEN (盤面部のみで可) + 手数 → GP ∈ [0, 1.5]。"""
     b = MiniBoard(sfen_body)
     whand, promo, camp, king, expo = _game_phase_state_counts_core(b)
     return _clamp(_calc_state_phase(whand, promo, camp, king, expo,
@@ -1220,7 +976,6 @@ def gp_of_sfen(sfen_body: str, ply: int = 0) -> float:
 
 
 def gp_of_record(raw40: bytes):
-    """PSV 40B レコード → (gp, score, gameply)。"""
     data32, score, _mv, gameply, _res, _pad = struct.unpack(PSV_FMT, raw40)
     sb = SvBoard()
     _fast_decode_psfen_into(data32, sb)
@@ -1236,12 +991,6 @@ def iter_psv(path):
             yield raw
 
 
-# ══ GP 学習機 (順序ペア + SPSA) ═══════════════════════════════════════════
-# [GP-FIT 2026-07-14] 「同一対局内で後の局面ほど GP が高い」順序制約で
-# 駒種価値テーブル (hv[6]+cv[13]=19 パラメータ、hv[P]=1 固定アンカー) を学習。
-# データ源: KIF 棋譜ディレクトリ (対局内ペア・強い制約) + PSV bin
-# (gamePly 差の大きい対局横断ペア・弱い制約)。SPSA (微分不要) + L2 正則化
-# (初期値=現行互換テーブルへ繋留)。式本体・15-vec は凍結 (学習対象は駒種のみ)。
 
 _KIF_ZEN = {c: i + 1 for i, c in enumerate("１２３４５６７８９")}
 _KIF_KAN = {c: i + 1 for i, c in enumerate("一二三四五六七八九")}
@@ -1278,7 +1027,6 @@ def _kif_hirate():
 
 
 def iter_kif_features(path):
-    """KIF 棋譜 → (moveno, features_v3) を各手後に yield (平手・本譜のみ)。"""
     raw = open(path, "rb").read()
     text = None
     for enc in ("cp932", "utf-8-sig", "utf-8"):
@@ -1311,7 +1059,7 @@ def iter_kif_features(path):
             base = (cap - 1) % 14 + 1
             idx = _KIF_DEMOTE.get(base)
             if idx is None:
-                return          # 玉捕獲 = 盤面脱同期。以降を捨てる
+                return
             sb.hand[side][idx] += 1
         org = (int(m.group(6)), int(m.group(7))) if m.group(6) else None
         if m.group(5) == "打" or org is None:
@@ -1323,7 +1071,7 @@ def iter_kif_features(path):
             osq = (org[1] - 1) * 9 + (9 - org[0])
             pid = sb.cells[osq]
             if pid == 0:
-                return          # 脱同期
+                return
             sb.cells[osq] = 0
             if m.group(4) == "成":
                 base = (pid - 1) % 14 + 1
@@ -1339,21 +1087,11 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
            pairs_per_game=400, bin_pairs=20000, min_dply_kif=8,
            min_dply_bin=40, lam=0.005, seed=7, out_json="gp_fit_result.json",
            wr_pairs=50000, wr_weight=0.25, wr_dply=10, wr_dcp=800):
-    """駒種価値テーブルの順序ペア学習。学習後テーブルと診断を返す (適用はしない)。
-
-    [WR-PAIR 2026-07-14] ply 順序 (主制約) に加え、PSV の score
-    (= 生成エンジンの本物の dlshogi 互換 eval) から第2制約を作る:
-      同一 ply 帯 (|Δply|≤wr_dply) で |score| 差 ≥ wr_dcp のペアについて
-      「|score| が高い側の GP ≥ 低い側」(重み wr_weight のソフト制約)。
-    根拠: 同じ手数なら形勢が決した局面ほど期待残り手数が短い = タイムライン上
-    終局に近い = 位相が後。sigmoid 勝率は |score| に単調なので WR 順序 ==
-    |score| 順序 (slope 非依存)。GP=位相 / eval=形勢の直交性は保つ —
-    eval は「残存手数の代理」としてのみ較正に寄与する。wr_pairs=0 で無効。"""
     import glob as _glob
     import json as _json
     import numpy as np
     rng = np.random.default_rng(seed)
-    feats = []      # (game_id, ply, h7, c13, promo, king, expo)
+    feats = []
     gid = 0
     n_games = 0
     if kif_dir:
@@ -1390,7 +1128,6 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
                     except Exception:
                         _dropped += 1
                         continue
-                    # [NOISE] 単一レコード版判定 (noise_mask_np と同一基準)
                     h7 = f3[0]
                     if (any(h7[i] > _HAND_CAPS[i] for i in range(7))
                             or f3[2] > 26 or not (0 <= f3[4] <= 16)
@@ -1414,7 +1151,6 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
     KG = np.array([f[5] for f in feats], np.float64)
     EX = np.array([f[6] for f in feats], np.float64)
 
-    # ── ペア構築 ──
     ei, lj = [], []
     for g in range(gid):
         idx = np.where(G == g)[0]
@@ -1439,7 +1175,6 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
         raise SystemExit(f"[gp-fit] ペア不足 ({npair})")
     margin = np.minimum(0.02, 0.0004 * (PLY[LJ] - PLY[EI]))
 
-    # [WR-PAIR] 同一 ply 帯 × |score| 差の大きい bin ペア (lo→hi で GP 非減少)
     WLO = WHI = None
     if wr_pairs > 0 and len(bin_scores) >= 2:
         babs = np.abs(np.array(bin_scores, np.float64))
@@ -1471,7 +1206,7 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
         gp = core + 0.5 * np.clip(ramp, 0.0, 1.0)
         return np.clip(gp, 0.0, 1.5)
 
-    th0 = np.array(GP_HAND_VALS[1:] + list(GP_CAMP_VALS), np.float64)  # 19
+    th0 = np.array(GP_HAND_VALS[1:] + list(GP_CAMP_VALS), np.float64)
     LO = np.full(19, 0.0); LO[:6] = 0.1
     HI = np.full(19, 25.0)
     def unpack(th):
@@ -1493,8 +1228,6 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
     l0, vr0 = loss(th0), viol_rate(th0)
     th = th0.copy()
     c0, A, alpha, gamma = 0.15, iters * 0.1, 0.602, 0.101
-    # [AUTO-SCALE] 初期勾配の大きさを実測して a0 を導出 — 損失スケールに
-    # 依存しない一歩幅 (初回ステップ ≈ target_step [パラメータ単位])。
     target_step = 0.08
     g_est = 0.0
     for _ in range(8):
@@ -1535,20 +1268,6 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
     return res
 
 
-# ══ GPU レーン (旧 gp_torch.py — 統合) ═══════════════════════════════════════
-# GP の fit / 教師局面グルーピングの GPU レーン (tarara/rshogi 流)
-#
-# 役割分担:
-#   CPU (numba) : PSV デコード + 特徴抽出を 1 回だけ → .gpfeat.npz キャッシュ
-#   GPU (torch) : 特徴テンソル常駐で fit (Adam/autograd) と grouping (GP評価+bucketize)
-#
-#   fit   : 順序ペア損失 relu(gp_early − gp_late + margin) を Adam で最小化。
-#   group : 特徴キャッシュ → GP → searchsorted → バケット .bin 書出し。
-#
-#   使い方:
-#     python gp_core.py torch-fit   --kif-dir kifs --bin teacher.bin [--iters 3000]
-#     python gp_core.py torch-group teacher.bin [--edges 0,0.1,...] [--ply-mode state]
-#     python gp_core.py torch-verify teacher.bin [--n 5000]
 
 try:
     import torch as _torch
@@ -1582,7 +1301,6 @@ def _torch_vec_params():
 
 
 def gp_tensor(feat, ply, hv, cv, vp):
-    """特徴テンソル (n,23) + ply → GP (torch, 微分可能)。gp_core と同一式。"""
     H = feat[:, 0:7]
     C = feat[:, 7:20]
     PR = feat[:, 20]
@@ -1600,7 +1318,6 @@ def gp_tensor(feat, ply, hv, cv, vp):
 
 
 def _torch_load_dataset(kif_dir, bin_path, bin_sample, device):
-    """fit 用データセット: (feat, ply, game_id, score) — game_id=-1 は bin。"""
     import numpy as np
     rows, plys, gids = [], [], []
     gid = 0
@@ -1824,12 +1541,10 @@ def _torch_apply_tables(path):
     print(f"[gp-torch] tables loaded: {path}")
 
 
-# [GP-GROUP-EDGES] 0.1 刻みのデフォルト edges 文字列
-_DEFAULT_GROUP_EDGES = ",".join(f"{x/10:.1f}" for x in range(16))  # "0.0,0.1,...,1.5"
+_DEFAULT_GROUP_EDGES = ",".join(f"{x/10:.1f}" for x in range(16))
 
 
 def _torch_group_one(bin_path, dev, edges, ply_mode, out_dir, report_only, writers=None):
-    """torch レーンで 1 ファイルをグルーピング。累積統計 dict を返す。"""
     import numpy as np
     F, P, S = features_batch_file(bin_path)
     n = F.shape[0]
@@ -1852,7 +1567,7 @@ def _torch_group_one(bin_path, dev, edges, ply_mode, out_dir, report_only, write
             ply_rec >= 1, ply_rec, est_t)
     gp = gp_tensor(feat, ply, hv, cv, vp)
     gp_np = gp.cpu().numpy()
-    del feat, ply_rec, ply, gp  # GPU メモリ解放
+    del feat, ply_rec, ply, gp
     nb = len(edges) - 1
     bad = np.isnan(gp_np)
     ids = np.clip(np.searchsorted(np.asarray(edges), gp_np, side="right") - 1,
@@ -1887,7 +1602,6 @@ def _torch_cmd_group(a):
     edges = sorted(float(x) for x in a.edges.split(","))
     nb = len(edges) - 1
 
-    # ディレクトリ対応
     if os.path.isdir(a.bin):
         bin_files = expand_bin_paths_done(a.bin, require_done=a.require_done)
         if not bin_files:
@@ -1972,7 +1686,6 @@ def _torch_cmd_verify(a):
 
 def _cli():
     import argparse
-    # サブコマンドがあるか確認 (torch-fit/torch-group/torch-verify)
     if len(sys.argv) > 1 and sys.argv[1].startswith("torch-"):
         _cli_torch()
         return
@@ -2067,7 +1780,6 @@ def _cli():
 
 
 def _cli_torch():
-    """旧 gp_torch.py の CLI エントリポイント (gp_core.py 統合版)。"""
     import argparse
     ap = argparse.ArgumentParser(description="GP fit/grouping GPU レーン")
     sub = ap.add_subparsers(dest="cmd", required=True)
