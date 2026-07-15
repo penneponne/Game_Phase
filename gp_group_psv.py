@@ -190,9 +190,7 @@ def main():
 
     edges = parse_edges(args.edges)
     nb = len(edges) - 1
-    out_dir = args.out_dir or (os.path.abspath(args.bin)
-                               if os.path.isdir(args.bin)
-                               else os.path.dirname(os.path.abspath(args.bin)))
+    out_dir = args.out_dir or os.path.join(".", f"{stem}_gp")
     os.makedirs(out_dir, exist_ok=True)
 
     # ── numba バッチレーン ──
@@ -315,3 +313,23 @@ def main():
     lines.append(f"{'bucket':22s} {'count':>10s} {'%':>7s} {'avg|cp|':>9s} {'avg ply':>8s}")
     for i in range(nb):
         c = counts[i]
+        pct = 100.0 * c / max(1, done - bad)
+        lines.append(f"GP[{edges[i]:.2f},{edges[i+1]:.2f}) {c:>10d} {pct:>6.2f}% "
+                         f"{(ssum[i]/c if c else 0):>9.1f} {(psum[i]/c if c else 0):>8.1f}")
+    lines.append("")
+    lines.append("# 0.05 刻みヒストグラム")
+    mx = max(hist.values()) if hist else 1
+    for k in sorted(hist):
+        lines.append(f"{k*0.05:5.2f} {hist[k]:>9d} " + "#" * max(1, int(40 * hist[k] / mx)))
+    report = "\n".join(lines)
+    print(report)
+    rp = os.path.join(out_dir, f"{stem}_gp_report.txt")
+    with open(rp, "w", encoding="utf-8") as f:
+        f.write(report + "\n")
+    print(f"[gp] report → {rp}")
+    if writers:
+        print(f"[gp] buckets → {out_dir}/{stem}_gp_*.bin")
+
+
+if __name__ == "__main__":
+    main()
