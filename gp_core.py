@@ -1909,8 +1909,7 @@ def _torch_cmd_group(a):
         bin_files = [a.bin]
         stem = os.path.splitext(os.path.basename(a.bin))[0]
 
-    out_dir = a.out_dir or (os.path.abspath(a.bin) if os.path.isdir(a.bin)
-                            else os.path.dirname(os.path.abspath(a.bin)))
+    out_dir = a.out_dir or os.path.join(".", f"{stem}_gp")
     os.makedirs(out_dir, exist_ok=True)
 
     writers = {}
