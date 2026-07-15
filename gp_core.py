@@ -147,20 +147,25 @@ def _fast_psfen_to_sfen(data32):
     return _svboard_to_sfen(sb)
 
 
-GP_HAND_VALS = [1.0,    2.9878, 2.9303, 4.8517, 4.915,  7.7843, 9.8869]
-GP_CAMP_VALS = [1.0601, 1.0085, 1.016,  1.0546, 1.0494, 1.0528, 1.0605,
-                0.9574, 1.0072, 1.0054, 1.0159, 1.031,  1.0719]
+# [FIT 2026-07-15c/TEACH-V3] Pyfamate ネイティブ teach (順序ペア + S-SPACE +
+# WR-PAIR, 200k局面) の焼付け値 — 親 Pyfamate.py の GP_Hand_Val_*/GP_Camp_Val_*
+# と同値 (違反率 ply 8.96%→7.92% / wr 41.3%→40.4%)。
+GP_HAND_VALS = [1.0,      2.775113, 2.066253, 3.120539, 3.911216, 4.574237, 7.863081]
+GP_CAMP_VALS = [1.396302, 1.177588, 1.248085, 1.297911, 1.444452, 1.066618, 1.40945,
+                0.563566, 1.186525, 0.91197,  1.020019, 0.592588, 1.458039]
 CAMP_TYPE_NAMES = ("P", "L", "N", "S", "G", "B", "R",
                    "+P", "+L", "+N", "+S", "+B", "+R")
 _GAME_PHASE_KING_SENTE_ROW = 7
 _GAME_PHASE_KING_GOTE_ROW  = 3
 
+# [SYNC 2026-07-15c] 親 Pyfamate.py の _GAME_PHASE_DEFAULT_VEC と同値
+# ([FIT 2026-07-15b] Onset/Full 込み)。乖離検出器は --verify。
 _GAME_PHASE_DEFAULT_VEC = (
-    0.266368, 0.0, 0.275166, 0.352129,
-    1.839152, 5.437156, 1.000000, 0.100000,
+    0.284323, 0.0, 0.299125, 0.465553,
+    1.996120, 5.424438, 1.043322, 0.100000,
     1.285300,
-    0.531332, 4.362364,
-    0.074838, 163.738998, 0.0, 12.181117,
+    0.500290, 4.699767,
+    0.051353, 194.823557, 0.0, 12.256584,
 )
 
 
@@ -1086,7 +1091,8 @@ def iter_kif_features(path):
 def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
            pairs_per_game=400, bin_pairs=20000, min_dply_kif=8,
            min_dply_bin=40, lam=0.005, seed=7, out_json="gp_fit_result.json",
-           wr_pairs=50000, wr_weight=0.25, wr_dply=10, wr_dcp=800):
+           wr_pairs=50000, wr_weight=0.25, wr_dply=10, wr_dcp=800,
+           s_weight=1.0):
     import glob as _glob
     import json as _json
     import numpy as np
@@ -1193,18 +1199,23 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
               f"Δ|cp|≥{wr_dcp}, weight={wr_weight})")
 
     v = GP_VIEW
-    def gp_all(hv, cv):
-        S = (v.game_phase_w_hand * (H @ hv) / v.game_phase_hand_ref
-             + v.game_phase_w_promo * PR / v.game_phase_promo_ref
-             + v.game_phase_w_camp * (C @ cv) / v.game_phase_camp_ref
-             + v.game_phase_w_king * KG / v.game_phase_king_ref
-             + v.game_phase_w_ply * PLY / v.game_phase_ply_ref
-             + v.game_phase_w_exposure * EX / v.game_phase_exposure_ref)
+    def s_all(hv, cv):
+        return (v.game_phase_w_hand * (H @ hv) / v.game_phase_hand_ref
+                + v.game_phase_w_promo * PR / v.game_phase_promo_ref
+                + v.game_phase_w_camp * (C @ cv) / v.game_phase_camp_ref
+                + v.game_phase_w_king * KG / v.game_phase_king_ref
+                + v.game_phase_w_ply * PLY / v.game_phase_ply_ref
+                + v.game_phase_w_exposure * EX / v.game_phase_exposure_ref)
+
+    def gp_from_s(S):
         core = 1.0 - np.exp(np.maximum(-S / v.game_phase_scale, -50.0))
         ramp = (KG - v.game_phase_nyugyoku_king_onset) / (
             v.game_phase_nyugyoku_king_full - v.game_phase_nyugyoku_king_onset)
         gp = core + 0.5 * np.clip(ramp, 0.0, 1.0)
         return np.clip(gp, 0.0, 1.5)
+
+    def gp_all(hv, cv):
+        return gp_from_s(s_all(hv, cv))
 
     th0 = np.array(GP_HAND_VALS[1:] + list(GP_CAMP_VALS), np.float64)
     LO = np.full(19, 0.0); LO[:6] = 0.1
@@ -1213,12 +1224,21 @@ def gp_fit(kif_dir=None, bin_path=None, bin_sample=30000, iters=2000,
         return (np.concatenate(([1.0], th[:6])), th[6:])
     def loss(th):
         hv, cv = unpack(th)
-        gp = gp_all(hv, cv)
+        S = s_all(hv, cv)
+        gp = gp_from_s(S)
         viol = np.maximum(gp[EI] - gp[LJ] + margin, 0.0)
         total = viol.mean() + lam * ((th - th0) ** 2).mean()
+        # [S-SPACE] 飽和前 S/scale の同符号 hinge — 終盤帯 (∂GP/∂cv≈0) でも
+        # cv 勾配を生存させる (TEACH-V3 と同定義)。
+        if s_weight > 0.0:
+            total += s_weight * np.maximum(
+                (S[EI] - S[LJ]) / v.game_phase_scale, 0.0).mean()
         if WLO is not None and len(WLO):
             wviol = np.maximum(gp[WLO] - gp[WHI] + 0.005, 0.0)
             total += wr_weight * wviol.mean()
+            if s_weight > 0.0:
+                total += wr_weight * s_weight * np.maximum(
+                    (S[WLO] - S[WHI]) / v.game_phase_scale, 0.0).mean()
         return total
     def viol_rate(th):
         hv, cv = unpack(th)
@@ -1300,7 +1320,7 @@ def _torch_vec_params():
         wexpo=v.game_phase_w_exposure, exporef=v.game_phase_exposure_ref)
 
 
-def gp_tensor(feat, ply, hv, cv, vp):
+def gp_tensor(feat, ply, hv, cv, vp, return_s=False):
     H = feat[:, 0:7]
     C = feat[:, 7:20]
     PR = feat[:, 20]
@@ -1314,7 +1334,10 @@ def gp_tensor(feat, ply, hv, cv, vp):
          + vp["wexpo"] * EX / vp["exporef"])
     core = 1.0 - _torch.exp(_torch.clamp(-S / vp["scale"], min=-50.0))
     ramp = _torch.clamp((KG - vp["onset"]) / (vp["full"] - vp["onset"]), 0.0, 1.0)
-    return _torch.clamp(core + 0.5 * ramp, 0.0, 1.5)
+    gp = _torch.clamp(core + 0.5 * ramp, 0.0, 1.5)
+    if return_s:
+        return gp, S
+    return gp
 
 
 def _torch_load_dataset(kif_dir, bin_path, bin_sample, device):
@@ -1475,16 +1498,24 @@ def _torch_cmd_fit(a):
     opt = _torch.optim.Adam(params, lr=a.lr)
     def gp_all():
         hv = _torch.cat([hv0[:1], hv_free])
-        return gp_tensor(feat, ply, hv, cv, vp_now())
+        return gp_tensor(feat, ply, hv, cv, vp_now(), return_s=True)
     def loss_fn():
-        gp = gp_all()
+        gp, S = gp_all()
         viol = _torch.relu(gp[EI_t] - gp[LJ_t] + margin)
         reg = a.lam * (((hv_free - hv0[1:]) ** 2).mean()
                        + ((cv - cv0) ** 2).mean())
         total = viol.mean() + reg
+        _scale = vp_now()["scale"]
+        # [S-SPACE] TEACH-V3 と同定義 (飽和帯の cv 勾配生存)。
+        if a.s_weight > 0.0:
+            total = total + a.s_weight * _torch.relu(
+                (S[EI_t] - S[LJ_t]) / _scale).mean()
         if WLO_t is not None:
             total = total + a.wr_weight * _torch.relu(
                 gp[WLO_t] - gp[WHI_t] + 0.005).mean()
+            if a.s_weight > 0.0:
+                total = total + a.wr_weight * a.s_weight * _torch.relu(
+                    (S[WLO_t] - S[WHI_t]) / _scale).mean()
         return total, gp
     with _torch.no_grad():
         l0, gp = loss_fn()
@@ -1703,6 +1734,8 @@ def _cli():
     ap.add_argument("--iters", type=int, default=2000)
     ap.add_argument("--wr-pairs", type=int, default=50000,
                     help="[WR-PAIR] eval由来の第2制約ペア数 (0=無効)")
+    ap.add_argument("--s-weight", type=float, default=1.0,
+                    help="[S-SPACE] 飽和前 S/scale hinge の重み (0=無効)")
     ap.add_argument("--calibrate", metavar="BIN",
                     help="ply 較正テーブルを再生成して表示 (gp_core.py へ手動反映)")
     ap.add_argument("--engine", default="Pyfamate.py")
@@ -1713,7 +1746,7 @@ def _cli():
         return
     if a.fit:
         gp_fit(kif_dir=a.kif_dir, bin_path=a.fit_bin, iters=a.iters,
-               wr_pairs=a.wr_pairs)
+               wr_pairs=a.wr_pairs, s_weight=a.s_weight)
         return
     if a.verify_fast:
         import time as _t
@@ -1799,6 +1832,8 @@ def _cli_torch():
     f.add_argument("--wr-weight", type=float, default=0.25)
     f.add_argument("--wr-dply", type=int, default=10)
     f.add_argument("--wr-dcp", type=float, default=800.0)
+    f.add_argument("--s-weight", type=float, default=1.0,
+                   help="[S-SPACE] 飽和前 S/scale hinge の重み (0=無効)")
     f.add_argument("--learn", default="pieces", choices=("pieces", "full"))
     f.add_argument("--seed", type=int, default=7)
     f.add_argument("--device", default="auto")
