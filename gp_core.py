@@ -191,16 +191,24 @@ def _fast_psfen_to_sfen(data32):
     return _svboard_to_sfen(sb)
 
 
-_GP_HAND_VALUES = {"P": 1, "L": 3, "N": 3, "S": 5, "G": 5, "B": 8, "R": 10}
+# [GP-v3 2026-07-14] 駒種価値テーブル (学習対象)。Pyfamate 本体と同値。
+#   GP_HAND_VALS[7]  : 手駒価値 P L N S G B R。P=1 がスケールアンカー。
+#   GP_CAMP_VALS[13] : 敵陣内の駒価値。生駒 P L N S G B R (idx0..6) +
+#                      成駒 +P +L +N +S +B +R (idx7..12)。
+GP_HAND_VALS = [1.0,    2.9878, 2.9303, 4.8517, 4.915,  7.7843, 9.8869]
+GP_CAMP_VALS = [1.0601, 1.0085, 1.016,  1.0546, 1.0494, 1.0528, 1.0605,
+                0.9574, 1.0072, 1.0054, 1.0159, 1.031,  1.0719]
+CAMP_TYPE_NAMES = ("P", "L", "N", "S", "G", "B", "R",
+                   "+P", "+L", "+N", "+S", "+B", "+R")
 _GAME_PHASE_KING_SENTE_ROW = 7   # USI row7 = 将棋7段目（先手: 9段目スタートから2段上がった位置）
 _GAME_PHASE_KING_GOTE_ROW  = 3   # USI row3 = 将棋3段目（後手: 1段目スタートから2段下がった位置）
 
 _GAME_PHASE_DEFAULT_VEC = (
-    0.125335, 0.0, 0.107800, 0.097863,           # W_Hand, W_Promo, W_Camp, W_King
-    9.278644, 5.686510, 7.314302, 1.532946,      # Hand_Ref, Promo_Ref, Camp_Ref, King_Ref
+    0.266368, 0.0, 0.275166, 0.352129,           # W_Hand, W_Promo, W_Camp, W_King
+    1.839152, 5.437156, 1.000000, 0.100000,      # Hand_Ref, Promo_Ref, Camp_Ref, King_Ref
     1.285300,                                    # Scale (fix_scale=1 で固定)
-    0.5, 2.5,                                    # Nyugyoku_King_Onset, Nyugyoku_King_Full [KING-v2 2026-07-14 再設定: ランプ幅≈2段]
-    0.524339, 139.157857, 0.0, 12.244777,        # W_Ply, Ply_Ref, W_Exposure, Exposure_Ref
+    0.531332, 4.362364,                          # Nyugyoku_King_Onset, Nyugyoku_King_Full [FIT 2026-07-15]
+    0.074838, 163.738998, 0.0, 12.181117,        # W_Ply, Ply_Ref, W_Exposure, Exposure_Ref
 )
 
 
@@ -375,24 +383,24 @@ def _game_phase_for_phase_council(raw_game_phase: float, restore_ratio: float) -
 
 
 def _game_phase_state_counts_core(board: "ShogiBoard") -> tuple:
-    """盤面状態 → GP の 5 構成要素 (whand, promoted, enemy_camp, king, exposure)。純粋関数。
+    """盤面状態 → GP の 5 構成要素 (whand, promoted, wcamp, king, exposure)。純粋関数。
 
-    whand      : 駒価値加重手駒合計 (先手+後手)。歩1/香桂3/銀金5/角8/飛10。
-                 旧 hand (単純総数) を置換。飛車持ちと歩5枚持ちを区別する。
-    promoted   : 盤上の成駒数 (両者)
-    enemy_camp : 敵陣 3 段以内にいる玉以外の駒数
-                 (先手駒は row 1..3、後手駒は row 7..9。玉を除くのは
-                  KING シグナルとの二重計上を避けるため — 特徴独立性の原則)
-    king       : ShogiBoard.king_advance_signal() (現在状態の玉前進深さ 0〜12)
-    exposure   : 玉露出度 = 16 − (両玉の ring1 味方駒合計)。0=完全防御, 16=完全露出。
-                 攻めが進むと防御駒が離れ exposure が上がる。
+    [GP-v3 2026-07-14] 駒種を学習対象化:
+      whand : Σ hand_count[t]·GP_HAND_VALS[t] (先手+後手, 7駒種)
+      promoted : 盤上の成駒数 (両者)
+      wcamp : Σ camp_count[t]·GP_CAMP_VALS[t] (敵陣内 生駒7種+成駒6種, 玉除く)
+      king  : ShogiBoard.king_advance_signal() (0〜12)
+      exposure : 16 − 両玉 ring1 味方駒合計
     """
-    whand = (sum(cnt * _GP_HAND_VALUES.get(pc.upper(), 1)
-                 for pc, cnt in board.sente_hand.items()) +
-             sum(cnt * _GP_HAND_VALUES.get(pc.upper(), 1)
-                 for pc, cnt in board.gote_hand.items()))
+    _HAND_IDX = {"P": 0, "L": 1, "N": 2, "S": 3, "G": 4, "B": 5, "R": 6}
+    whand = 0.0
+    for hand in (board.sente_hand, board.gote_hand):
+        for pc, cnt in hand.items():
+            whand += cnt * GP_HAND_VALS[_HAND_IDX[pc.upper()]]
+    _CAMP_IDX = {"P": 0, "L": 1, "N": 2, "S": 3, "G": 4, "B": 5, "R": 6,
+                 "+P": 7, "+L": 8, "+N": 9, "+S": 10, "+B": 11, "+R": 12}
     promoted = 0
-    enemy_camp = 0
+    wcamp = 0.0
     king_positions = {}
     cells = []
     for (c, r), pc in board.board.items():
@@ -407,10 +415,9 @@ def _game_phase_state_counts_core(board: "ShogiBoard") -> tuple:
             continue
         is_sente = base.isupper()
         cells.append((c, r, is_sente))
-        if is_sente and r <= 3:
-            enemy_camp += 1
-        elif (not is_sente) and r >= 7:
-            enemy_camp += 1
+        if (is_sente and r <= 3) or ((not is_sente) and r >= 7):
+            _t = ("+" if pc.startswith("+") else "") + base.upper()
+            wcamp += GP_CAMP_VALS[_CAMP_IDX[_t]]
     ally_ring1 = 0
     for side, is_ally_sente in [("b", True), ("w", False)]:
         kp = king_positions.get(side)
@@ -421,7 +428,7 @@ def _game_phase_state_counts_core(board: "ShogiBoard") -> tuple:
             if piece_sente == is_ally_sente and max(abs(cc - kc), abs(cr - kr)) == 1:
                 ally_ring1 += 1
     exposure = 16 - ally_ring1
-    return (whand, promoted, enemy_camp, board.king_advance_signal(), exposure)
+    return (whand, promoted, wcamp, board.king_advance_signal(), exposure)
 
 
 
@@ -1203,25 +1210,6 @@ def gp_of_record_v2(raw40: bytes, ply_mode: str = "auto"):
 # ══ 公開 API ═══════════════════════════════════════════════════════════════
 
 GP_VIEW = _GpParamView(_GAME_PHASE_DEFAULT_VEC)   # 正準パラメータ (ply_enable=True)
-
-# [GP-v3 2026-07-14] 駒種価値テーブル (学習対象)。
-#   GP_HAND_VALS[7]  : 手駒価値 P L N S G B R (手駒に成駒は無い)。P=1 が
-#                      スケールアンカー (学習時も固定)。初期値 = 旧 _GP_HAND_VALUES。
-#   GP_CAMP_VALS[13] : 敵陣内の駒の価値。生駒 P L N S G B R (idx0..6) +
-#                      成駒 +P +L +N +S +B +R (idx7..12)。玉は KING 特徴が担当。
-#                      初期値 = 全 1.0 (旧 CAMP=個数カウントと完全互換)。
-#   whand = Σ GP_HAND_VALS·hand,  wcamp = Σ GP_CAMP_VALS·camp を既存式の
-#   WHAND/CAMP 入力に流す (式本体 _calc_state_phase は不変)。
-#   学習は `python gp_core.py --fit ...` (順序ペア + SPSA)。適用は本テーブルと
-#   Pyfamate の GP_Hand_Val_* / GP_Camp_Val_* キーを同値更新すること。
-# [FIT 2026-07-15] gp_fit_result.json 焼付け値 (loss 0.02087→0.02078, 違反率
-# 3.54%→3.46%; 3000iter/adam/GPU/100k位置/200kペア)。単調性維持・下限張り付き無し。
-GP_HAND_VALS = [1.0,    2.9878, 2.9303, 4.8517, 4.915,  7.7843, 9.8869]
-GP_CAMP_VALS = [1.0601, 1.0085, 1.016,  1.0546, 1.0494, 1.0528, 1.0605,
-                0.9574, 1.0072, 1.0054, 1.0159, 1.031,  1.0719]
-CAMP_TYPE_NAMES = ("P", "L", "N", "S", "G", "B", "R",
-                   "+P", "+L", "+N", "+S", "+B", "+R")
-
 
 def gp_of_sfen(sfen_body: str, ply: int = 0) -> float:
     """SFEN (盤面部のみで可) + 手数 → GP ∈ [0, 1.5]。"""
